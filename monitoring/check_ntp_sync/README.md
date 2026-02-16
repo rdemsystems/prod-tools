@@ -32,7 +32,7 @@ If none are available → UNKNOWN.
 ### CheckMK local check (900s cache)
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/monitoring/check_ntp_sync/check_ntp_sync -o /usr/lib/check_mk_agent/local/900/check_ntp_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_ntp_sync
+sudo mkdir -p /usr/lib/check_mk_agent/local/900 && sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/monitoring/check_ntp_sync/check_ntp_sync -o /usr/lib/check_mk_agent/local/900/check_ntp_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_ntp_sync
 ```
 
 ### Nagios / NRPE

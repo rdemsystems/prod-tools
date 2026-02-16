@@ -22,7 +22,7 @@ Compatible with **Nagios/NRPE/MRPE** and **CheckMK local check**.
 ### CheckMK local check (900s cache)
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/corosync/check_cluster_time_sync/check_cluster_time_sync -o /usr/lib/check_mk_agent/local/900/check_cluster_time_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_cluster_time_sync
+sudo mkdir -p /usr/lib/check_mk_agent/local/900 && sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/corosync/check_cluster_time_sync/check_cluster_time_sync -o /usr/lib/check_mk_agent/local/900/check_cluster_time_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_cluster_time_sync
 ```
 
 ### Nagios / NRPE

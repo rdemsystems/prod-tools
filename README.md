@@ -36,7 +36,7 @@ Target: Debian 12/13 and derivatives.
 
 ```bash
 # CheckMK (900s cache)
-sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/monitoring/check_ntp_sync/check_ntp_sync -o /usr/lib/check_mk_agent/local/900/check_ntp_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_ntp_sync
+sudo mkdir -p /usr/lib/check_mk_agent/local/900 && sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/monitoring/check_ntp_sync/check_ntp_sync -o /usr/lib/check_mk_agent/local/900/check_ntp_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_ntp_sync
 
 # Nagios / NRPE
 sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/monitoring/check_ntp_sync/check_ntp_sync -o /usr/lib/nagios/plugins/check_ntp_sync && sudo chmod +x /usr/lib/nagios/plugins/check_ntp_sync
@@ -46,7 +46,7 @@ sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/mo
 
 ```bash
 # CheckMK (900s cache)
-sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/corosync/check_cluster_time_sync/check_cluster_time_sync -o /usr/lib/check_mk_agent/local/900/check_cluster_time_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_cluster_time_sync
+sudo mkdir -p /usr/lib/check_mk_agent/local/900 && sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/corosync/check_cluster_time_sync/check_cluster_time_sync -o /usr/lib/check_mk_agent/local/900/check_cluster_time_sync && sudo chmod +x /usr/lib/check_mk_agent/local/900/check_cluster_time_sync
 
 # Nagios / NRPE
 sudo curl -fsSL https://raw.githubusercontent.com/rdemsystems/prod-tools/main/corosync/check_cluster_time_sync/check_cluster_time_sync -o /usr/lib/nagios/plugins/check_cluster_time_sync && sudo chmod +x /usr/lib/nagios/plugins/check_cluster_time_sync
