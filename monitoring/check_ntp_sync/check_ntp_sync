@@ -106,7 +106,7 @@ try_chronyc() {
     STRATUM=$(echo "$tracking" | awk '/^Stratum/ { print $NF }')
     SOURCE=$(echo "$tracking" | awk '/^Reference ID/ { gsub(/[()]/, "", $NF); print $NF }')
     local leap
-    leap=$(echo "$tracking" | awk '/^Leap status/ { $1=$2=""; gsub(/^[[:space:]]+/,"",$0); print }')
+    leap=$(echo "$tracking" | awk -F': ' '/^Leap status/ { print $2 }')
 
     if [[ -n "$leap" ]] && [[ "$leap" != "Normal" ]]; then
         update_worst $STATE_WARNING
@@ -241,7 +241,7 @@ fi
 SUMMARY="${STATUS_TEXT} - NTP offset ${OFFSET_MS}ms${DETAIL}"
 
 PERFDATA="ntp_offset=${OFFSET_S}s;${WARN_S};${CRIT_S}"
-[[ -n "$STRATUM" ]] && PERFDATA="${PERFDATA} stratum=${STRATUM}"
+[[ -n "$STRATUM" ]] && PERFDATA="${PERFDATA}|stratum=${STRATUM}"
 
 if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
     echo "P \"NTP Sync\" ${PERFDATA} ${SUMMARY}"

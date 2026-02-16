@@ -209,7 +209,7 @@ if command -v chronyc &>/dev/null; then
         if [[ -n "$abs_off" ]]; then
             SIGNED_OFFSETS+=("$signed_off")
             OFFSET_NODE_NAMES+=("${NODE_NAMES[$LOCAL_IDX]}")
-            PERFDATA="${PERFDATA} ${NODE_NAMES[$LOCAL_IDX]}_chrony_offset=${abs_off}s"
+            PERFDATA="${PERFDATA}|${NODE_NAMES[$LOCAL_IDX]}_chrony_offset=${abs_off}s"
         fi
 
         # Check leap
@@ -243,7 +243,7 @@ for i in "${!NODE_ADDRS[@]}"; do
     remote_tracking=$(ssh $SSH_OPTS "root@${node_addr}" "chronyc tracking 2>/dev/null" 2>/dev/null) || {
         update_worst $STATE_CRITICAL
         DETAILS="${DETAILS}${node_name}: SSH UNREACHABLE or chrony unavailable; "
-        PERFDATA="${PERFDATA} ${node_name}_chrony_offset=U"
+        PERFDATA="${PERFDATA}|${node_name}_chrony_offset=U"
         continue
     }
 
@@ -252,11 +252,11 @@ for i in "${!NODE_ADDRS[@]}"; do
     if [[ -n "$abs_off" ]]; then
         SIGNED_OFFSETS+=("$signed_off")
         OFFSET_NODE_NAMES+=("$node_name")
-        PERFDATA="${PERFDATA} ${node_name}_chrony_offset=${abs_off}s"
+        PERFDATA="${PERFDATA}|${node_name}_chrony_offset=${abs_off}s"
     else
         update_worst $STATE_WARNING
         DETAILS="${DETAILS}${node_name}: chrony offset unavailable; "
-        PERFDATA="${PERFDATA} ${node_name}_chrony_offset=U"
+        PERFDATA="${PERFDATA}|${node_name}_chrony_offset=U"
     fi
 
     # Check leap
