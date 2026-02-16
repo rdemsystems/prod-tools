@@ -186,7 +186,17 @@ PERFDATA=""
 DETAILS=""
 SOURCES_BY_NODE=()
 NODE_COUNT=${#NODE_ADDRS[@]}
-SSH_OPTS="-o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
+
+# SSH ControlMaster: pre-establish connections so time measurements
+# run on already-open channels with symmetric, low-latency RTT.
+# Without this, SSH handshake overhead (~100ms) skews drift measurements.
+SSH_CONTROL_DIR=$(mktemp -d /tmp/check_cluster_time_sync.XXXXXX)
+# shellcheck disable=SC2317
+cleanup_ssh() { rm -rf "$SSH_CONTROL_DIR"; }
+trap cleanup_ssh EXIT
+
+SSH_BASE_OPTS="-o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
+SSH_MUX_OPTS="$SSH_BASE_OPTS -o ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p"
 
 # Store local sources
 SOURCES_BY_NODE[LOCAL_IDX]="${NODE_NAMES[$LOCAL_IDX]}:${LOCAL_SOURCES}"
@@ -198,16 +208,25 @@ update_worst() {
     fi
 }
 
+# --- Phase 1: Establish SSH ControlMaster connections ---
+for i in "${!NODE_ADDRS[@]}"; do
+    [[ $i -eq $LOCAL_IDX ]] && continue
+    node_addr="${NODE_ADDRS[$i]}"
+    # shellcheck disable=SC2086
+    ssh $SSH_MUX_OPTS -o ControlMaster=yes -o ControlPersist=60 -fN "root@${node_addr}" 2>/dev/null || true
+done
+
+# --- Phase 2: Measure drift and collect data over established connections ---
 for i in "${!NODE_ADDRS[@]}"; do
     [[ $i -eq $LOCAL_IDX ]] && continue
 
     node_addr="${NODE_ADDRS[$i]}"
     node_name="${NODE_NAMES[$i]}"
 
-    # --- Measure drift via SSH (midpoint method) ---
+    # --- Measure drift via SSH (midpoint method over pre-established mux) ---
     t1=$(date +%s.%N)
     # shellcheck disable=SC2086
-    remote_time=$(ssh $SSH_OPTS "root@${node_addr}" "date +%s.%N" 2>/dev/null) || {
+    remote_time=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "date +%s.%N" 2>/dev/null) || {
         update_worst $STATE_CRITICAL
         DETAILS="${DETAILS}${node_name}: SSH UNREACHABLE; "
         PERFDATA="${PERFDATA} ${node_name}_drift=U"
@@ -241,13 +260,13 @@ for i in "${!NODE_ADDRS[@]}"; do
 
     # --- Chrony tracking on remote node ---
     # shellcheck disable=SC2086
-    remote_tracking=$(ssh $SSH_OPTS "root@${node_addr}" "chronyc tracking 2>/dev/null" 2>/dev/null) || {
+    remote_tracking=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "chronyc tracking 2>/dev/null" 2>/dev/null) || {
         update_worst $STATE_WARNING
         DETAILS="${DETAILS}${node_name}: chrony unavailable; "
         PERFDATA="${PERFDATA} ${node_name}_chrony_offset=U"
         # Still try to get sources
         # shellcheck disable=SC2086
-        remote_sources=$(ssh $SSH_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
+        remote_sources=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
         SOURCES_BY_NODE[i]="${node_name}:${remote_sources}"
         continue
     }
@@ -277,7 +296,7 @@ for i in "${!NODE_ADDRS[@]}"; do
 
     # --- NTP sources on remote node ---
     # shellcheck disable=SC2086
-    remote_sources=$(ssh $SSH_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
+    remote_sources=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
     SOURCES_BY_NODE[i]="${node_name}:${remote_sources}"
 done
 
