@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# check_ntp_sync - Verify local NTP synchronization
+# Compatible with Nagios/NRPE/MRPE and CheckMK local check
+# License: MIT
+
+set -euo pipefail
+
+# Nagios exit codes
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+# Defaults
+WARN_MS=50
+CRIT_MS=200
+NTP_SERVER="pool.ntp.org"
+VERBOSE=0
+OUTPUT_MODE=""  # auto-detect
+
+usage() {
+    cat <<'EOF'
+Usage: check_ntp_sync [OPTIONS]
+
+Verify local NTP synchronization.
+Tries chronyc, ntpq, timedatectl, and ntpdate (in order).
+
+Options:
+  -w, --warning <ms>     Offset warning threshold in ms (default: 50)
+  -c, --critical <ms>    Offset critical threshold in ms (default: 200)
+  -s, --ntp-server <srv> NTP server for fallback query (default: pool.ntp.org)
+  --checkmk              Force CheckMK output (auto-detected normally)
+  --nagios               Force Nagios output (override auto-detection)
+  -v, --verbose          Show details
+  -h, --help             Show help
+
+Exit codes (Nagios standard):
+  0  OK       - NTP synchronized within thresholds
+  1  WARNING  - Offset above warning threshold or minor issues
+  2  CRITICAL - Offset above critical threshold
+  3  UNKNOWN  - No NTP client detected
+EOF
+    exit "$STATE_UNKNOWN"
+}
+
+# --- Argument parsing ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -w|--warning)    WARN_MS="$2"; shift 2 ;;
+        -c|--critical)   CRIT_MS="$2"; shift 2 ;;
+        -s|--ntp-server) NTP_SERVER="$2"; shift 2 ;;
+        --checkmk)       OUTPUT_MODE="checkmk"; shift ;;
+        --nagios)        OUTPUT_MODE="nagios"; shift ;;
+        -v|--verbose)    VERBOSE=1; shift ;;
+        -h|--help)       usage ;;
+        *)               echo "UNKNOWN - Unknown option: $1"; exit "$STATE_UNKNOWN" ;;
+    esac
+done
+
+# --- Auto-detect output mode ---
+detect_output_mode() {
+    [[ -n "$OUTPUT_MODE" ]] && return
+    if [[ -n "${MK_LIBDIR:-}" ]] || [[ -n "${MK_CONFDIR:-}" ]]; then
+        OUTPUT_MODE="checkmk"
+        return
+    fi
+    local script_path
+    script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    if [[ "$script_path" == *check_mk_agent/local/* ]] || [[ "$script_path" == *check_mk/local/* ]]; then
+        OUTPUT_MODE="checkmk"
+        return
+    fi
+    OUTPUT_MODE="nagios"
+}
+detect_output_mode
+
+# --- Convert thresholds to seconds ---
+WARN_S=$(awk "BEGIN { printf \"%.6f\", $WARN_MS / 1000 }")
+CRIT_S=$(awk "BEGIN { printf \"%.6f\", $CRIT_MS / 1000 }")
+
+# --- State tracking ---
+WORST_STATE=$STATE_OK
+OFFSET_S=""
+OFFSET_MS=""
+STRATUM=""
+SOURCE=""
+METHOD=""
+EXTRA_INFO=""
+
+update_worst() {
+    local new_state=$1
+    if [[ $new_state -gt $WORST_STATE ]]; then
+        WORST_STATE=$new_state
+    fi
+}
+
+# --- Method 1: chronyc tracking ---
+try_chronyc() {
+    command -v chronyc &>/dev/null || return 1
+    local tracking
+    tracking=$(chronyc tracking 2>/dev/null) || return 1
+
+    OFFSET_S=$(echo "$tracking" | awk '/^System time/ { for(i=1;i<=NF;i++) if($i ~ /^[0-9]/) { print $i; exit } }')
+    [[ -z "$OFFSET_S" ]] && return 1
+
+    STRATUM=$(echo "$tracking" | awk '/^Stratum/ { print $NF }')
+    SOURCE=$(echo "$tracking" | awk '/^Reference ID/ { gsub(/[()]/, "", $NF); print $NF }')
+    local leap
+    leap=$(echo "$tracking" | awk '/^Leap status/ { $1=$2=""; gsub(/^[[:space:]]+/,"",$0); print }')
+
+    if [[ -n "$leap" ]] && [[ "$leap" != "Normal" ]]; then
+        update_worst $STATE_WARNING
+        EXTRA_INFO="leap=${leap}"
+    fi
+
+    METHOD="chronyc"
+    return 0
+}
+
+# --- Method 2: ntpq -c peers ---
+try_ntpq() {
+    command -v ntpq &>/dev/null || return 1
+    local peers
+    peers=$(ntpq -c peers 2>/dev/null) || return 1
+
+    # Find the active peer (marked with *)
+    local active_line
+    active_line=$(echo "$peers" | grep '^\*' | head -1)
+    [[ -z "$active_line" ]] && return 1
+
+    # ntpq offset is in ms
+    local offset_ms_raw
+    offset_ms_raw=$(echo "$active_line" | awk '{ print $(NF-1) }')
+    [[ -z "$offset_ms_raw" ]] && return 1
+
+    OFFSET_S=$(awk "BEGIN { v = $offset_ms_raw; if (v < 0) v = -v; printf \"%.6f\", v / 1000 }")
+    OFFSET_MS=$(awk "BEGIN { v = $offset_ms_raw; if (v < 0) v = -v; printf \"%.1f\", v }")
+    STRATUM=$(echo "$active_line" | awk '{ print $3 }')
+    SOURCE=$(echo "$active_line" | awk '{ gsub(/^\*/, "", $1); print $1 }')
+    METHOD="ntpq"
+    return 0
+}
+
+# --- Method 3: timedatectl (systemd-timesyncd) ---
+try_timedatectl() {
+    command -v timedatectl &>/dev/null || return 1
+    local td_show
+    td_show=$(timedatectl show 2>/dev/null) || return 1
+
+    local synced
+    synced=$(echo "$td_show" | awk -F= '/^NTPSynchronized/ { print $2 }')
+    [[ "$synced" != "yes" ]] && return 1
+
+    # timedatectl doesn't expose precise offset; report 0 and note the method
+    OFFSET_S="0.000000"
+    STRATUM=""
+    SOURCE="systemd-timesyncd"
+    METHOD="timedatectl"
+    EXTRA_INFO="synchronized=yes (offset not available via timedatectl)"
+    return 0
+}
+
+# --- Method 4: ntpdate -q (query only, last resort) ---
+try_ntpdate() {
+    command -v ntpdate &>/dev/null || return 1
+    local result
+    result=$(ntpdate -q "$NTP_SERVER" 2>/dev/null) || return 1
+
+    # Parse "offset X.XXXXX sec"
+    local offset_raw
+    offset_raw=$(echo "$result" | awk '/offset/ { for(i=1;i<=NF;i++) if($i=="offset") { print $(i+1); exit } }')
+    [[ -z "$offset_raw" ]] && return 1
+
+    OFFSET_S=$(awk "BEGIN { v = $offset_raw; if (v < 0) v = -v; printf \"%.6f\", v }")
+    STRATUM=$(echo "$result" | awk '/stratum/ { for(i=1;i<=NF;i++) if($i=="stratum") { gsub(/,/,"",$(i+1)); print $(i+1); exit } }')
+    SOURCE="$NTP_SERVER"
+    METHOD="ntpdate"
+    return 0
+}
+
+# --- Run detection chain ---
+if ! try_chronyc && ! try_ntpq && ! try_timedatectl && ! try_ntpdate; then
+    MSG="No NTP client detected (tried: chronyc, ntpq, timedatectl, ntpdate)"
+    if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
+        echo "3 \"NTP Sync\" - UNKNOWN - $MSG"
+    else
+        echo "UNKNOWN - $MSG"
+    fi
+    exit "$STATE_UNKNOWN"
+fi
+
+# --- Calculate offset in ms if not already set ---
+if [[ -z "$OFFSET_MS" ]]; then
+    OFFSET_MS=$(awk "BEGIN { printf \"%.1f\", $OFFSET_S * 1000 }")
+fi
+
+# --- Evaluate offset thresholds ---
+is_crit=$(awk "BEGIN { print ($OFFSET_MS >= $CRIT_MS) ? 1 : 0 }")
+is_warn=$(awk "BEGIN { print ($OFFSET_MS >= $WARN_MS) ? 1 : 0 }")
+if [[ "$is_crit" -eq 1 ]]; then
+    update_worst $STATE_CRITICAL
+elif [[ "$is_warn" -eq 1 ]]; then
+    update_worst $STATE_WARNING
+fi
+
+# --- Evaluate stratum ---
+if [[ -n "$STRATUM" ]]; then
+    if [[ "$STRATUM" -gt 15 ]] 2>/dev/null; then
+        update_worst $STATE_CRITICAL
+    elif [[ "$STRATUM" -gt 10 ]] 2>/dev/null; then
+        update_worst $STATE_WARNING
+    fi
+fi
+
+# --- Build output ---
+case $WORST_STATE in
+    0) STATUS_TEXT="OK" ;;
+    1) STATUS_TEXT="WARNING" ;;
+    2) STATUS_TEXT="CRITICAL" ;;
+    *) STATUS_TEXT="UNKNOWN" ;;
+esac
+
+SOURCE_INFO=""
+[[ -n "$SOURCE" ]] && SOURCE_INFO="source: ${SOURCE}"
+STRATUM_INFO=""
+[[ -n "$STRATUM" ]] && STRATUM_INFO="stratum ${STRATUM}"
+
+# Build detail string
+DETAIL_PARTS=()
+[[ -n "$SOURCE_INFO" ]] && DETAIL_PARTS+=("$SOURCE_INFO")
+[[ -n "$STRATUM_INFO" ]] && DETAIL_PARTS+=("$STRATUM_INFO")
+[[ -n "$METHOD" ]] && [[ $VERBOSE -eq 1 ]] && DETAIL_PARTS+=("via ${METHOD}")
+[[ -n "$EXTRA_INFO" ]] && [[ $VERBOSE -eq 1 ]] && DETAIL_PARTS+=("$EXTRA_INFO")
+
+DETAIL=""
+if [[ ${#DETAIL_PARTS[@]} -gt 0 ]]; then
+    DETAIL=$(IFS=', '; echo "${DETAIL_PARTS[*]}")
+    DETAIL=" (${DETAIL})"
+fi
+
+SUMMARY="${STATUS_TEXT} - NTP offset ${OFFSET_MS}ms${DETAIL}"
+
+PERFDATA="ntp_offset=${OFFSET_S}s;${WARN_S};${CRIT_S}"
+[[ -n "$STRATUM" ]] && PERFDATA="${PERFDATA} stratum=${STRATUM}"
+
+if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
+    echo "P \"NTP Sync\" ${PERFDATA} ${SUMMARY}"
+else
+    echo "${SUMMARY} | ${PERFDATA}"
+fi
+
+exit "$WORST_STATE"
