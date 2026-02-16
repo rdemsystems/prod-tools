@@ -24,7 +24,8 @@ usage() {
 Usage: check_cluster_time_sync [OPTIONS]
 
 Verify time synchronization across a Corosync cluster.
-Checks inter-node drift, NTP source consistency, and chrony health.
+Checks inter-node drift (via chrony offsets), NTP source consistency,
+and chrony health on each node.
 
 Options:
   -w, --warning <ms>     Drift warning threshold in ms (default: 1)
@@ -41,6 +42,9 @@ Exit codes (Nagios standard):
   1  WARNING  - Drift above warning threshold or minor issues
   2  CRITICAL - Drift above critical threshold or node unreachable
   3  UNKNOWN  - Missing dependencies or configuration
+
+Drift is computed from chrony system time offsets (not SSH timestamps),
+giving microsecond accuracy regardless of SSH latency.
 EOF
     exit "$STATE_UNKNOWN"
 }
@@ -81,19 +85,23 @@ detect_output_mode
 WARN_S=$(awk "BEGIN { printf \"%.6f\", $WARN_MS / 1000 }")
 CRIT_S=$(awk "BEGIN { printf \"%.6f\", $CRIT_MS / 1000 }")
 
+# --- Output helper ---
+output_msg() {
+    local state=$1 msg=$2
+    if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
+        echo "${state} \"Cluster Time Sync\" - ${msg}"
+    else
+        echo "${msg}"
+    fi
+    exit "$state"
+}
+
 # --- Check corosync config ---
 if [[ ! -f "$COROSYNC_CONF" ]]; then
-    MSG="Corosync config not found: $COROSYNC_CONF"
-    if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
-        echo "3 \"Cluster Time Sync\" - UNKNOWN - $MSG"
-    else
-        echo "UNKNOWN - $MSG"
-    fi
-    exit "$STATE_UNKNOWN"
+    output_msg "$STATE_UNKNOWN" "UNKNOWN - Corosync config not found: $COROSYNC_CONF"
 fi
 
 # --- Parse nodes from corosync.conf ---
-# Extracts ring0_addr and name from each node {} block
 parse_nodes() {
     awk '
     /^[[:space:]]*node[[:space:]]*\{/ { in_node=1; addr=""; name="" }
@@ -125,13 +133,7 @@ while read -r addr name; do
 done < <(parse_nodes)
 
 if [[ ${#NODE_ADDRS[@]} -eq 0 ]]; then
-    MSG="No nodes found in $COROSYNC_CONF"
-    if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
-        echo "3 \"Cluster Time Sync\" - UNKNOWN - $MSG"
-    else
-        echo "UNKNOWN - $MSG"
-    fi
-    exit "$STATE_UNKNOWN"
+    output_msg "$STATE_UNKNOWN" "UNKNOWN - No nodes found in $COROSYNC_CONF"
 fi
 
 # --- Detect local node ---
@@ -153,53 +155,37 @@ for i in "${!NODE_ADDRS[@]}"; do
 done
 
 if [[ $LOCAL_IDX -eq -1 ]]; then
-    MSG="Cannot identify local node in corosync config (hostname=$LOCAL_HOSTNAME)"
-    if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
-        echo "3 \"Cluster Time Sync\" - UNKNOWN - $MSG"
-    else
-        echo "UNKNOWN - $MSG"
-    fi
-    exit "$STATE_UNKNOWN"
+    output_msg "$STATE_UNKNOWN" "UNKNOWN - Cannot identify local node in corosync config (hostname=$LOCAL_HOSTNAME)"
 fi
 
-# --- Collect local NTP sources ---
-LOCAL_SOURCES=""
-if command -v chronyc &>/dev/null; then
-    LOCAL_SOURCES=$(chronyc sources -n 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//')
-fi
+# --- Parse chrony tracking output ---
+# Returns: signed_offset_seconds absolute_offset_seconds stratum leap_status
+parse_chrony_tracking() {
+    local tracking="$1"
+    local offset sign stratum leap
 
-# --- Collect local chrony tracking ---
-LOCAL_CHRONY_OFFSET=""
-LOCAL_CHRONY_STRATUM=""
-LOCAL_CHRONY_LEAP=""
-if command -v chronyc &>/dev/null; then
-    local_tracking=$(chronyc tracking 2>/dev/null || true)
-    LOCAL_CHRONY_OFFSET=$(echo "$local_tracking" | awk '/^System time/ { for(i=1;i<=NF;i++) if($i ~ /^[0-9]/) { print $i; exit } }')
-    LOCAL_CHRONY_STRATUM=$(echo "$local_tracking" | awk '/^Stratum/ { print $NF }')
-    LOCAL_CHRONY_LEAP=$(echo "$local_tracking" | awk '/^Leap status/ { $1=$2=""; gsub(/^[[:space:]]+/,"",$0); print }')
-fi
+    # Parse offset: "0.000062890 seconds fast of NTP time" or "... slow of NTP time"
+    offset=$(echo "$tracking" | awk '/^System time/ { for(i=1;i<=NF;i++) if($i ~ /^[0-9]/) { print $i; exit } }')
+    sign=$(echo "$tracking" | awk '/^System time/ { for(i=1;i<=NF;i++) if($i=="fast") { print "+"; exit } else if($i=="slow") { print "-"; exit } }')
+    stratum=$(echo "$tracking" | awk '/^Stratum/ { print $NF }')
+    # Parse leap status: field after ": " separator
+    leap=$(echo "$tracking" | awk -F': ' '/^Leap status/ { print $2 }')
 
-# --- SSH to remote nodes ---
+    echo "${sign}${offset} ${offset} ${stratum} ${leap}"
+}
+
+# --- SSH setup ---
 WORST_STATE=$STATE_OK
-MAX_DRIFT=0
 PERFDATA=""
 DETAILS=""
 SOURCES_BY_NODE=()
 NODE_COUNT=${#NODE_ADDRS[@]}
 
-# SSH ControlMaster: pre-establish connections so time measurements
-# run on already-open channels with symmetric, low-latency RTT.
-# Without this, SSH handshake overhead (~100ms) skews drift measurements.
-SSH_CONTROL_DIR=$(mktemp -d /tmp/check_cluster_time_sync.XXXXXX)
-# shellcheck disable=SC2317
-cleanup_ssh() { rm -rf "$SSH_CONTROL_DIR"; }
-trap cleanup_ssh EXIT
+SSH_OPTS="-o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
 
-SSH_BASE_OPTS="-o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
-SSH_MUX_OPTS="$SSH_BASE_OPTS -o ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p"
-
-# Store local sources
-SOURCES_BY_NODE[LOCAL_IDX]="${NODE_NAMES[$LOCAL_IDX]}:${LOCAL_SOURCES}"
+# Signed chrony offsets for drift calculation (fast=+, slow=-)
+declare -a SIGNED_OFFSETS=()
+declare -a OFFSET_NODE_NAMES=()
 
 update_worst() {
     local new_state=$1
@@ -208,113 +194,124 @@ update_worst() {
     fi
 }
 
-# --- Phase 1: Establish SSH ControlMaster connections ---
-for i in "${!NODE_ADDRS[@]}"; do
-    [[ $i -eq $LOCAL_IDX ]] && continue
-    node_addr="${NODE_ADDRS[$i]}"
-    # shellcheck disable=SC2086
-    ssh $SSH_MUX_OPTS -o ControlMaster=yes -o ControlPersist=60 -fN "root@${node_addr}" 2>/dev/null || true
-done
+# --- Collect local chrony data ---
+LOCAL_SOURCES=""
+if command -v chronyc &>/dev/null; then
+    LOCAL_SOURCES=$(chronyc sources -n 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//')
+fi
+SOURCES_BY_NODE[LOCAL_IDX]="${NODE_NAMES[$LOCAL_IDX]}:${LOCAL_SOURCES}"
 
-# --- Phase 2: Measure drift and collect data over established connections ---
+if command -v chronyc &>/dev/null; then
+    local_tracking=$(chronyc tracking 2>/dev/null || true)
+    if [[ -n "$local_tracking" ]]; then
+        read -r signed_off abs_off l_stratum l_leap <<< "$(parse_chrony_tracking "$local_tracking")"
+
+        if [[ -n "$abs_off" ]]; then
+            SIGNED_OFFSETS+=("$signed_off")
+            OFFSET_NODE_NAMES+=("${NODE_NAMES[$LOCAL_IDX]}")
+            PERFDATA="${PERFDATA} ${NODE_NAMES[$LOCAL_IDX]}_chrony_offset=${abs_off}s"
+        fi
+
+        # Check leap
+        if [[ -n "$l_leap" ]] && [[ "$l_leap" != "Normal" ]]; then
+            update_worst $STATE_WARNING
+            DETAILS="${DETAILS}${NODE_NAMES[$LOCAL_IDX]}(local): leap='${l_leap}'; "
+        fi
+
+        # Check stratum
+        if [[ -n "$l_stratum" ]]; then
+            if [[ "$l_stratum" -gt 15 ]] 2>/dev/null; then
+                update_worst $STATE_CRITICAL
+                DETAILS="${DETAILS}${NODE_NAMES[$LOCAL_IDX]}(local): stratum ${l_stratum} CRITICAL; "
+            elif [[ "$l_stratum" -gt 10 ]] 2>/dev/null; then
+                update_worst $STATE_WARNING
+                DETAILS="${DETAILS}${NODE_NAMES[$LOCAL_IDX]}(local): stratum ${l_stratum} WARNING; "
+            fi
+        fi
+    fi
+fi
+
+# --- Collect remote node data ---
 for i in "${!NODE_ADDRS[@]}"; do
     [[ $i -eq $LOCAL_IDX ]] && continue
 
     node_addr="${NODE_ADDRS[$i]}"
     node_name="${NODE_NAMES[$i]}"
 
-    # --- Measure drift via SSH (midpoint method over pre-established mux) ---
-    t1=$(date +%s.%N)
-    # shellcheck disable=SC2086
-    remote_time=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "date +%s.%N" 2>/dev/null) || {
-        update_worst $STATE_CRITICAL
-        DETAILS="${DETAILS}${node_name}: SSH UNREACHABLE; "
-        PERFDATA="${PERFDATA} ${node_name}_drift=U"
-        continue
-    }
-    t2=$(date +%s.%N)
-
-    drift=$(awk "BEGIN { mid = ($t1 + $t2) / 2; d = $remote_time - mid; if (d < 0) d = -d; printf \"%.6f\", d }")
-    drift_ms=$(awk "BEGIN { printf \"%.1f\", $drift * 1000 }")
-
-    PERFDATA="${PERFDATA} ${node_name}_drift=${drift}s"
-
-    # Track max drift
-    is_max=$(awk "BEGIN { print ($drift > $MAX_DRIFT) ? 1 : 0 }")
-    if [[ "$is_max" -eq 1 ]]; then
-        MAX_DRIFT=$drift
-    fi
-
-    # Evaluate drift thresholds
-    is_crit=$(awk "BEGIN { print ($drift_ms >= $CRIT_MS) ? 1 : 0 }")
-    is_warn=$(awk "BEGIN { print ($drift_ms >= $WARN_MS) ? 1 : 0 }")
-    if [[ "$is_crit" -eq 1 ]]; then
-        update_worst $STATE_CRITICAL
-        DETAILS="${DETAILS}${node_name}: drift ${drift_ms}ms CRITICAL; "
-    elif [[ "$is_warn" -eq 1 ]]; then
-        update_worst $STATE_WARNING
-        DETAILS="${DETAILS}${node_name}: drift ${drift_ms}ms WARNING; "
-    else
-        DETAILS="${DETAILS}${node_name}: drift ${drift_ms}ms OK; "
-    fi
-
     # --- Chrony tracking on remote node ---
     # shellcheck disable=SC2086
-    remote_tracking=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "chronyc tracking 2>/dev/null" 2>/dev/null) || {
-        update_worst $STATE_WARNING
-        DETAILS="${DETAILS}${node_name}: chrony unavailable; "
+    remote_tracking=$(ssh $SSH_OPTS "root@${node_addr}" "chronyc tracking 2>/dev/null" 2>/dev/null) || {
+        update_worst $STATE_CRITICAL
+        DETAILS="${DETAILS}${node_name}: SSH UNREACHABLE or chrony unavailable; "
         PERFDATA="${PERFDATA} ${node_name}_chrony_offset=U"
-        # Still try to get sources
-        # shellcheck disable=SC2086
-        remote_sources=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
-        SOURCES_BY_NODE[i]="${node_name}:${remote_sources}"
         continue
     }
 
-    chrony_offset=$(echo "$remote_tracking" | awk '/^System time/ { for(j=1;j<=NF;j++) if($j ~ /^[0-9]/) { print $j; exit } }')
-    chrony_stratum=$(echo "$remote_tracking" | awk '/^Stratum/ { print $NF }')
-    chrony_leap=$(echo "$remote_tracking" | awk '/^Leap status/ { $1=$2=""; gsub(/^[[:space:]]+/,"",$0); print }')
+    read -r signed_off abs_off r_stratum r_leap <<< "$(parse_chrony_tracking "$remote_tracking")"
 
-    [[ -n "$chrony_offset" ]] && PERFDATA="${PERFDATA} ${node_name}_chrony_offset=${chrony_offset}s"
-
-    # Check leap status
-    if [[ -n "$chrony_leap" ]] && [[ "$chrony_leap" != "Normal" ]]; then
+    if [[ -n "$abs_off" ]]; then
+        SIGNED_OFFSETS+=("$signed_off")
+        OFFSET_NODE_NAMES+=("$node_name")
+        PERFDATA="${PERFDATA} ${node_name}_chrony_offset=${abs_off}s"
+    else
         update_worst $STATE_WARNING
-        DETAILS="${DETAILS}${node_name}: leap='${chrony_leap}'; "
+        DETAILS="${DETAILS}${node_name}: chrony offset unavailable; "
+        PERFDATA="${PERFDATA} ${node_name}_chrony_offset=U"
+    fi
+
+    # Check leap
+    if [[ -n "$r_leap" ]] && [[ "$r_leap" != "Normal" ]]; then
+        update_worst $STATE_WARNING
+        DETAILS="${DETAILS}${node_name}: leap='${r_leap}'; "
     fi
 
     # Check stratum
-    if [[ -n "$chrony_stratum" ]]; then
-        if [[ "$chrony_stratum" -gt 15 ]] 2>/dev/null; then
+    if [[ -n "$r_stratum" ]]; then
+        if [[ "$r_stratum" -gt 15 ]] 2>/dev/null; then
             update_worst $STATE_CRITICAL
-            DETAILS="${DETAILS}${node_name}: stratum ${chrony_stratum} CRITICAL; "
-        elif [[ "$chrony_stratum" -gt 10 ]] 2>/dev/null; then
+            DETAILS="${DETAILS}${node_name}: stratum ${r_stratum} CRITICAL; "
+        elif [[ "$r_stratum" -gt 10 ]] 2>/dev/null; then
             update_worst $STATE_WARNING
-            DETAILS="${DETAILS}${node_name}: stratum ${chrony_stratum} WARNING; "
+            DETAILS="${DETAILS}${node_name}: stratum ${r_stratum} WARNING; "
         fi
     fi
 
     # --- NTP sources on remote node ---
     # shellcheck disable=SC2086
-    remote_sources=$(ssh $SSH_MUX_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
+    remote_sources=$(ssh $SSH_OPTS "root@${node_addr}" "chronyc sources -n 2>/dev/null" 2>/dev/null | awk '/^\^/ { print $2 }' | sort | tr '\n' ',' | sed 's/,$//') || remote_sources=""
     SOURCES_BY_NODE[i]="${node_name}:${remote_sources}"
 done
 
-# --- Check local chrony health ---
-if [[ -n "$LOCAL_CHRONY_LEAP" ]] && [[ "$LOCAL_CHRONY_LEAP" != "Normal" ]]; then
+# --- Compute inter-node drift from chrony signed offsets ---
+# Drift = max(signed_offset) - min(signed_offset) across all nodes
+# This gives the worst-case clock difference between any two nodes.
+MAX_DRIFT=0
+if [[ ${#SIGNED_OFFSETS[@]} -ge 2 ]]; then
+    MAX_DRIFT=$(printf '%s\n' "${SIGNED_OFFSETS[@]}" | awk '
+        BEGIN { min=999999; max=-999999 }
+        { v=$1+0; if(v<min) min=v; if(v>max) max=v }
+        END { d=max-min; if(d<0) d=-d; printf "%.6f", d }
+    ')
+fi
+
+MAX_DRIFT_MS=$(awk "BEGIN { printf \"%.3f\", $MAX_DRIFT * 1000 }")
+
+# Evaluate drift thresholds
+is_crit=$(awk "BEGIN { print ($MAX_DRIFT_MS >= $CRIT_MS) ? 1 : 0 }")
+is_warn=$(awk "BEGIN { print ($MAX_DRIFT_MS >= $WARN_MS) ? 1 : 0 }")
+if [[ "$is_crit" -eq 1 ]]; then
+    update_worst $STATE_CRITICAL
+elif [[ "$is_warn" -eq 1 ]]; then
     update_worst $STATE_WARNING
-    DETAILS="${DETAILS}${NODE_NAMES[$LOCAL_IDX]}(local): leap='${LOCAL_CHRONY_LEAP}'; "
 fi
-if [[ -n "$LOCAL_CHRONY_STRATUM" ]]; then
-    if [[ "$LOCAL_CHRONY_STRATUM" -gt 15 ]] 2>/dev/null; then
-        update_worst $STATE_CRITICAL
-        DETAILS="${DETAILS}${NODE_NAMES[$LOCAL_IDX]}(local): stratum ${LOCAL_CHRONY_STRATUM} CRITICAL; "
-    elif [[ "$LOCAL_CHRONY_STRATUM" -gt 10 ]] 2>/dev/null; then
-        update_worst $STATE_WARNING
-        DETAILS="${DETAILS}${NODE_NAMES[$LOCAL_IDX]}(local): stratum ${LOCAL_CHRONY_STRATUM} WARNING; "
-    fi
+
+# Add per-node drift detail in verbose mode
+if [[ $VERBOSE -eq 1 ]] && [[ ${#SIGNED_OFFSETS[@]} -ge 1 ]]; then
+    for idx in "${!SIGNED_OFFSETS[@]}"; do
+        off_ms=$(awk "BEGIN { v=${SIGNED_OFFSETS[$idx]}; if(v<0) v=-v; printf \"%.3f\", v*1000 }")
+        DETAILS="${DETAILS}${OFFSET_NODE_NAMES[$idx]}: chrony_offset=${off_ms}ms; "
+    done
 fi
-[[ -n "$LOCAL_CHRONY_OFFSET" ]] && PERFDATA="${PERFDATA} ${NODE_NAMES[$LOCAL_IDX]}_chrony_offset=${LOCAL_CHRONY_OFFSET}s"
 
 # --- Check NTP source consistency ---
 SOURCES_CONSISTENT=1
@@ -344,8 +341,6 @@ else
 fi
 
 # --- Build output ---
-MAX_DRIFT_MS=$(awk "BEGIN { printf \"%.1f\", $MAX_DRIFT * 1000 }")
-
 case $WORST_STATE in
     0) STATUS_TEXT="OK" ;;
     1) STATUS_TEXT="WARNING" ;;
