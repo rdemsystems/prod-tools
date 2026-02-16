@@ -244,7 +244,7 @@ PERFDATA="ntp_offset=${OFFSET_S}s;${WARN_S};${CRIT_S}"
 [[ -n "$STRATUM" ]] && PERFDATA="${PERFDATA}|stratum=${STRATUM}"
 
 if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
-    echo "P \"NTP Sync\" ${PERFDATA} ${SUMMARY}"
+    echo "${WORST_STATE} \"NTP Sync\" ${PERFDATA} ${SUMMARY}"
 else
     echo "${SUMMARY} | ${PERFDATA}"
 fi

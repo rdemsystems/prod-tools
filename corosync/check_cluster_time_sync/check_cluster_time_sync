@@ -356,7 +356,7 @@ if [[ $VERBOSE -eq 1 ]] && [[ -n "$DETAILS" ]]; then
 fi
 
 if [[ "$OUTPUT_MODE" == "checkmk" ]]; then
-    echo "P \"Cluster Time Sync\" ${MAIN_PERFDATA} ${SUMMARY}"
+    echo "${WORST_STATE} \"Cluster Time Sync\" ${MAIN_PERFDATA} ${SUMMARY}"
 else
     echo "${SUMMARY} | ${MAIN_PERFDATA}"
 fi
